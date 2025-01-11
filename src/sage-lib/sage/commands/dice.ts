@@ -1,6 +1,6 @@
 import { DiceOutputType, DicePostType, DiceSecretMethodType, type DiceCritMethodType, type GameSystemType } from "@rsc-sage/types";
 import type { Optional } from "@rsc-utils/core-utils";
-import { error } from "@rsc-utils/core-utils";
+import { debug, error } from "@rsc-utils/core-utils";
 import { processStatBlocks } from "@rsc-utils/dice-utils";
 import { xRegExp } from "@rsc-utils/dice-utils/build/internal/xRegExp.js";
 import { type MessageChannel, type MessageTarget } from "@rsc-utils/discord-utils";
@@ -119,16 +119,16 @@ async function parseDiscordDice(sageCommand: TInteraction, diceString: string, o
 	});
 }
 
-async function parseDiscordMacro(sageCommand: SageCommand, macroString: string, macroStack: string[] = []): Promise<TDiceOutput[] | null> {
+async function parseDiscordMacro(sageCommand: SageCommand, macroString: string, namedArgStack: KeyValueArg[], macroStack: string[] = []): Promise<TDiceOutput[] | null> {
 	if (!sageCommand.isSageMessage()) {
 		return null;
 	}
 
 	const statsAndMacros = await prepStatsAndMacros(sageCommand);
 	const tsvMacros = statsAndMacros?.macros ?? [];
-	const macroAndOutput = macroToDice(sageCommand.sageUser.macros.concat(tsvMacros), unwrap(macroString, "[]"));
+	const macroAndOutput = macroToDice(sageCommand.sageUser.macros.concat(tsvMacros), unwrap(macroString, "[]"), namedArgStack);
 	if (macroAndOutput) {
-		const { macro, output } = macroAndOutput;
+		const { macro, output, namedArgs } = macroAndOutput;
 		if (macroStack.includes(macro.name) && !isRandomItem(macroString)) {
 			error(`Macro Recursion`, { macroString, macroStack });
 			const parsedDice = await parseDiscordDice(sageCommand, `[1d1 Recursion!]`);
@@ -140,7 +140,7 @@ async function parseDiscordMacro(sageCommand: SageCommand, macroString: string, 
 		const outputs: TDiceOutput[] = [];
 		for (const dice of diceToParse) {
 			if (!isRandomItem(dice)) {
-				const diceMacroOutputs = await parseDiscordMacro(sageCommand, dice, macroStack.concat([macro.name]));
+				const diceMacroOutputs = await parseDiscordMacro(sageCommand, dice, namedArgs.concat(namedArgStack), macroStack.concat([macro.name]));
 				if (diceMacroOutputs?.length) {
 					outputs.push(...diceMacroOutputs);
 					continue;
@@ -226,7 +226,7 @@ export async function parseDiceMatches(sageMessage: TInteraction, content: strin
 		const match = execArray[0];
 		const index = execArray.index;
 		const inline = isWrapped(match, "[[]]");
-		const output = await parseDiscordMacro(sageMessage, content.slice(index, index + match.length))
+		const output = await parseDiscordMacro(sageMessage, content.slice(index, index + match.length), [])
 			?? await parseMatch(sageMessage, content.slice(index, index + match.length));
 		if (output.length) {
 			diceMatches.push({ match, index, inline, output });
@@ -396,6 +396,7 @@ type TMacroAndArgs = TArgs & { macro?: TMacro; prefix: TPrefix; };
 function parseMacroAndArgs(userMacros: NamedCollection<TMacro>, input: string): TMacroAndArgs {
 	const [prefix, userMacro, slicedArgs] = findPrefixMacroArgs(userMacros, input);
 	const macroArgs = userMacro ? parseMacroArgs(slicedArgs) : null;
+	debug({userMacro,macroArgs});
 	return {
 		indexed: macroArgs?.indexed ?? [],
 		macro: userMacro ?? undefined,
@@ -404,13 +405,12 @@ function parseMacroAndArgs(userMacros: NamedCollection<TMacro>, input: string): 
 	};
 }
 
-function nonEmptyStringOrDefaultValue(arg: Optional<string>, def: Optional<string>): string {
+function nonEmptyStringOrDefaultValue(arg: Optional<string>, def: Optional<string>): Optional<string> {
 	const argOrEmptyString = arg ?? "";
-	const defOrEmptyString = def ?? "";
-	return argOrEmptyString !== "" ? argOrEmptyString : defOrEmptyString;
+	return argOrEmptyString !== "" ? argOrEmptyString : def;
 }
 
-function namedArgValueOrDefaultValue(arg: Optional<KeyValueArg>, def: Optional<string>): string {
+function namedArgValueOrDefaultValue(arg: Optional<KeyValueArg>, def: Optional<string>): Optional<string> {
 	if (arg) {
 		const value = nonEmptyStringOrDefaultValue(arg.value, def);
 		if (arg.keyLower.match(/^(ac|dc|vs)$/) && value) {
@@ -418,22 +418,11 @@ function namedArgValueOrDefaultValue(arg: Optional<KeyValueArg>, def: Optional<s
 		}
 		return value;
 	}
-	return def ?? "";
+	return def;
 }
 
-function splitKeyValueFromBraces(input: string): [string, string] {
-	const debraced = input.slice(1, -1);
-	const sliceIndex = debraced.indexOf(":");
-	if (sliceIndex < 0) {
-		return [debraced, ""];
-	}
-	const key = debraced.slice(0, sliceIndex);
-	const value = debraced.slice(sliceIndex + 1);
-	return [key, value];
-}
-
-type TMacroAndOutput = { macro: TMacro; output: string; };
-function macroToDice(userMacros: NamedCollection<TMacro>, input: string): TMacroAndOutput | null {
+type TMacroAndOutput = { macro: TMacro; namedArgs:KeyValueArg[]; output: string; };
+function macroToDice(userMacros: NamedCollection<TMacro>, input: string, namedArgStack: KeyValueArg[]): TMacroAndOutput | null {
 	const { prefix, macro, indexed, named } = parseMacroAndArgs(userMacros, input);
 	if (!macro) {
 		return null;
@@ -441,18 +430,19 @@ function macroToDice(userMacros: NamedCollection<TMacro>, input: string): TMacro
 
 	let maxIndex = -1;
 	let dice = macro.dice
-		// indexed args
-		.replace(/\{(\d+)(:(?!:)([-+]?\d+))?\}/g, match => {
-			const [argIndex, defaultValue] = splitKeyValueFromBraces(match);
-			maxIndex = Math.max(maxIndex, +argIndex);
-			return nonEmptyStringOrDefaultValue(indexed[+argIndex], defaultValue);
-		})
-		// named args
-		.replace(/\{(\w+)(:(?!:)[^}]+)?\}/ig, match => {
-			const [argName, defaultValue] = splitKeyValueFromBraces(match);
-			const argNameLower = argName.toLowerCase();
-			const namedArg = named.find(arg => arg.keyLower === argNameLower);
-			return namedArgValueOrDefaultValue(namedArg, defaultValue);
+		.replace(/\{(\w+)(:(?!:)[^}]*)?\}/ig, (_, key: string, defaultValue?: string) => {
+			const isIndexed = /^\d+$/.test(key);
+			defaultValue = defaultValue?.slice(1);
+			if (isIndexed) {
+				const keyIndex = +key;
+				maxIndex = Math.max(maxIndex, keyIndex);
+				return nonEmptyStringOrDefaultValue(indexed[keyIndex], defaultValue) ?? `{${key}}`;
+			}else {
+				const keyLower = key.toLowerCase();
+				const namedArg = named.find(arg => arg.keyLower === keyLower)
+					?? namedArgStack.find(arg => arg.keyLower === keyLower);
+				return namedArgValueOrDefaultValue(namedArg, defaultValue) ?? `{${key}}`;
+			}
 		})
 		// remaining args
 		.replace(/\{\.{3}\}/g, indexed.slice(maxIndex + 1).join(" "))
@@ -477,7 +467,8 @@ function macroToDice(userMacros: NamedCollection<TMacro>, input: string): TMacro
 
 	return {
 		macro: macro,
-		output: output.join("")
+		namedArgs: named,
+		output: output.join(""),
 	};
 }
 
