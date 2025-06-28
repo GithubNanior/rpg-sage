@@ -63,7 +63,7 @@ export async function renderBackground(mapCache: MapCache): Promise<boolean> {
 				drawLine(mapCache.context, x, 0, x, bgHeight);
 			}
 			for (let row = 0; row <= gridRows; row++) {
-				const y = row * pxPerCol;
+				const y = row * pxPerRow;
 				drawLine(mapCache.context, 0, y, bgWidth, y);
 			}
 
